@@ -4,13 +4,14 @@
 #include<mutex>
 #include<thread>
 
-
 extern void* mtalloc(size_t bytes);
 extern void mtfree(void* ptr);
 
-
 static const size_t MAX_BLOCK_SIZE = 1024 * 8;
 static const int BINS_NUMBER = 13;
+static const size_t MIN_BLOCK_THRESHOLD = 5;
+static const long double MEMORY_FRACTION_THRESHOLD = 0.25;
+
 
 class Superblock {
 public:
@@ -286,7 +287,9 @@ private:
 
 	bool checkIfEmpty() {
 		long double alpha = (long double)usedMemory / (long double)getMaxMemory();
-		if (alpha < 0.25) {
+		if (alpha < MEMORY_FRACTION_THRESHOLD
+			&& (usedMemory < (getMaxMemory() 
+				- MIN_BLOCK_THRESHOLD * MAX_BLOCK_SIZE))) {
 			return true;
 		}
 		return false;
@@ -439,10 +442,6 @@ private:
 		heap->free(ptr);
 	}
 
-	
-
-
-
 	int getMinHeap() {
 		int min = 10e6;
 		int minId = 0;
@@ -457,7 +456,7 @@ private:
 
 };
 
-GlobalHeap global;
+static GlobalHeap global;
 
 class ThreadRegister {
 public:
@@ -471,7 +470,6 @@ public:
 };
 
 static thread_local ThreadRegister regObj;
-
 
 extern void* mtalloc(size_t bytes) {
 	return global.allocate(bytes);
