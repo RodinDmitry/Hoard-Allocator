@@ -379,8 +379,8 @@ public:
 	}
 	
 	void* allocate(size_t size) {
-		std::unique_lock<std::mutex> lock(operationMutex);
 		if (size > MAX_BLOCK_SIZE / 2) {
+			std::unique_lock<std::mutex> lock(operationMutex);
 			void* memoryBlock = std::malloc(size);
 			allocatedMemory.insert(memoryBlock);
 			return memoryBlock;
@@ -389,8 +389,8 @@ public:
 	}
 
 	void free(void* pointer) {
-		std::unique_lock<std::mutex> lock(operationMutex);
 		if (allocatedMemory.count(pointer) != 0) {
+			std::unique_lock<std::mutex> lock(operationMutex);
 			allocatedMemory.erase(pointer);
 			std::free(pointer);
 		}
@@ -433,12 +433,14 @@ private:
 	}
 
 	void releaseFromThread(void* ptr) {
+		std::unique_lock<std::mutex> lock(operationMutex);
 		Superblock* block = ptrToBlock[ptr];
 		if (blockHeap.isFree(block)) {
 			blockHeap.deallocateFromFree(ptr, block);
 			return;
 		}
 		ThreadHeap* heap = blockToHeap[block];
+		lock.unlock();
 		heap->free(ptr);
 	}
 
