@@ -3,480 +3,433 @@
 #include<set>
 #include<mutex>
 #include<thread>
+#include<algorithm>
+
 
 extern void* mtalloc(size_t bytes);
 extern void mtfree(void* ptr);
 
 static const size_t MAX_BLOCK_SIZE = 1024 * 8;
-static const int BINS_NUMBER = 13;
+static const size_t MIN_BLOCK_SIZE = 8;
 static const size_t MIN_BLOCK_THRESHOLD = 5;
-static const long double MEMORY_FRACTION_THRESHOLD = 0.25;
+static const long double MEMORY_FRACTION_THRESHOLD = 4;
+
+// std::thread::hardware_concurrency может вернуть 0 в некоторых случаях
+static const size_t HEAPS_NUMBER = 
+	std::max(std::thread::hardware_concurrency() * 2,(unsigned int)8);
+thread_local const size_t THREAD_ID = 
+	std::hash<std::thread::id>()(std::this_thread::get_id()) % HEAPS_NUMBER;
 
 
 class Superblock {
 public:
-	
-	Superblock() {
-		createBlock();
+
+	Superblock(size_t size) {
+		base = std::malloc(MAX_BLOCK_SIZE);
+		usedMemory = 0;
+		ownerHeap = -1;
+		blockSize = normalize(size);
+		totalBlocks = MAX_BLOCK_SIZE / blockSize;
+		currentPosition = totalBlocks - 1;
+		for (int i = 0; i < totalBlocks; i++) {
+			freeBlocks.push_back(i * blockSize);
+		}
 	}
 
 	~Superblock() {
 		std::free(base);
 	}
 
-	void* getBlock(size_t size) {
-		unsigned int minBlockId = block.size();
-		for (unsigned int i = 0; i < block.size() ; ++i) {
-			if (!blockUsage[i] && blockSize[i] >= size) {
-				minBlockId = i;
-			}
+	void* getBlock() {
+		if (currentPosition == totalBlocks) {
+			return nullptr;
 		}
-		blockUsage[minBlockId] = true;
-		return block[minBlockId];
+		auto pt = freeBlocks[currentPosition];
+		currentPosition--;
+		return (char*)base + pt;
 	}
 
-	size_t releaseBlock(void*& memoryPointer) {
-		for (unsigned int i = 0; i < block.size(); ++i) {
-			if (block[i] == memoryPointer) {
-				size += blockSize[i];
-				blockUsage[i] = false;
-				return blockSize[i];
-			}
-		}
-		return 0;
+	void releaseBlock(void* block) {
+		char* ptr = (char*)block;
+		size_t position = ptr - (char*)base;
+		currentPosition++;
+		freeBlocks[currentPosition] = position;
 	}
 
 	size_t getSize() {
-		return size;
+		return blockSize;
 	}
 
-	bool tryAllocate(size_t size) {
-		for (unsigned int i = 0; i < block.size(); ++i) {
-			if (blockSize[i] >= size && blockUsage[i]) {
-				return true;
-			}
-		}
-		return false;
-	}
 	
-	bool getBlockStatus(int i) {
-		return blockUsage[12 - i];
-	}
-
-
+	
+	int ownerHeap;
+	int totalBlocks;
+	int currentPosition;
+	size_t usedMemory;
+	
+	std::mutex operationMutex;
 
 private:
 
 	void* base;
-	std::vector<void*> block;
-	std::vector<size_t> blockSize;
-	std::vector<bool> blockUsage;
-	size_t size;
+	std::vector<size_t> freeBlocks;
+	size_t blockSize;
 
-	void createBlock() {
-		base = std::malloc(MAX_BLOCK_SIZE);
-		size = MAX_BLOCK_SIZE;
-		size_t tempSize = MAX_BLOCK_SIZE / 2;
-		while (tempSize > 0) {
-			void* memBlock = (void*)((char*)base + tempSize);
-			block.push_back(memBlock);
-			blockSize.push_back(tempSize);
-			blockUsage.push_back(false);
-			tempSize /= 2;
+	size_t normalize(size_t size) {
+		size_t size2 = MIN_BLOCK_SIZE;
+		while (size2 < size) {
+			size2 *= 2;
 		}
+		return size2;
 	}
-
 };
 
-struct blockInfo {
-	Superblock* block;
-
-	size_t getSize() {
-		return block->getSize();
-	}
-
-};
-
-bool operator > (blockInfo left, blockInfo right) {
-	return left.getSize() < right.getSize();
-}
-
-bool operator < (blockInfo left, blockInfo right) {
-	return left.getSize() > right.getSize();
-}
-
-class FreeBlocksHeap {
+class SuperblockOwner {
 public:
-
-	FreeBlocksHeap() {
-		for (int i = 0; i < BINS_NUMBER; ++i) {
-			bins.push_back(std::set <blockInfo>());
-		}
-	}
-
-	~FreeBlocksHeap() {
-		for (auto block : allocatedBlocks) {
+	~SuperblockOwner() {
+		for (auto block : blocks) {
 			delete block;
 		}
 	}
 
-	Superblock* getBlock(size_t size) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		Superblock* block = blockSearch(size);
-		if (block == nullptr) {
-			return getNewBlock();
-		}
-		freeBlocks.erase(block);
+	Superblock* getNewBlock(size_t blockSize) {
+		Superblock* block = new Superblock(blockSize);
+		blocks.push_back(block);
 		return block;
 	}
 
-	void giveBlock(Superblock* block) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		addFreeBlock(block);
+	static SuperblockOwner& getInstance() {
+		static SuperblockOwner instance;
+		return instance;
 	}
 
-	bool isFree(Superblock* block) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		return (freeBlocks.count(block) > 0);
+private:
+	std::vector<Superblock*> blocks;
+};
+
+class Bin {
+public:
+	Bin() {
+		allocatedMemory = 0;
+		usedMemory = 0;
 	}
 
-	void deallocateFromFree(void* ptr, Superblock* block) {
+	void addSuperblock(Superblock* block) {
+
+		if (block->currentPosition == -1) {
+			fullBlocks.push_back(block);
+			return;
+		}
+		fullnessGroups.push_back(block);
+	}
+
+	Superblock* getBlock() {
+
+		if (fullnessGroups.empty()) {
+			return nullptr;
+		}
+		Superblock* block = fullnessGroups.front();
+		std::swap(fullnessGroups[0], fullnessGroups.back());
+		fullnessGroups.pop_back();
+		return block;
+	}
+
+	void deallocate(Superblock* block, void *ptr) {
+		if (block->currentPosition == -1) {
+			block->releaseBlock(ptr);
+			auto it = std::find(fullBlocks.begin(), fullBlocks.end(), block) - fullBlocks.begin();
+			std::swap(fullBlocks.back(), fullBlocks[it]);
+			fullBlocks.pop_back();
+			fullnessGroups.push_back(block);
+			return;
+		}
 		block->releaseBlock(ptr);
-		updateBins(block);
+	}
+
+	std::pair<Superblock*, void*> scan() {
+		if (fullnessGroups.empty()) {
+			return { nullptr, nullptr };
+		}
+
+		Superblock* superblock = fullnessGroups.back();
+		fullnessGroups.pop_back();
+		auto block = superblock->getBlock();
+		return { superblock, block };
+	}
+
+	void updateMemory(size_t used,size_t allocated, bool signum) {
+		if (signum) {
+			usedMemory += used;
+			allocatedMemory += allocated;
+		}
+		else {
+			usedMemory -= used;
+			allocatedMemory -= allocated;
+		}
+	}
+
+	size_t getUsed() {
+		return usedMemory;
+	}
+
+	size_t getAllocated() {
+		return allocatedMemory;
 	}
 
 private:
 
-	std::vector<std::set<blockInfo>> bins;
-	std::set<Superblock*> freeBlocks;
-	std::set<Superblock*> allocatedBlocks;
-	std::mutex operationMutex;
+	size_t allocatedMemory;
+	size_t usedMemory;
+	size_t iterator = 0;
 
-	Superblock* getSuperBlock(size_t size) {
-		Superblock* block = blockSearch(size);
-		if (block != nullptr) {
-			return block;
-		}
-		return getNewBlock();
-	}
+	std::vector<Superblock*> fullnessGroups;
+	std::vector<Superblock*> fullBlocks;
 
-	Superblock* getNewBlock() {
-		Superblock* block = new Superblock;
-		allocatedBlocks.insert(block);
-		return block;
-	}
-
-	void addFreeBlock(Superblock* block) {
-		freeBlocks.insert(block);
-		for (int i = 0; i < BINS_NUMBER; ++i) {
-			if (!block->getBlockStatus(i)) {
-				bins[i].insert({ block });
-			}
-		}
-	}
-
-	Superblock* blockSearch(size_t size) {
-		size_t size2 = 1;
-		int log = 0;
-		while (size2 <  size) {
-			size2 *= 2;
-			log++;
-		}
-		for (unsigned int i = log; i < bins.size(); ++i) {
-			if (bins[i].size() > 0) {
-				Superblock* block = (*bins[i].begin()).block;
-				return block;
-			}
-		}
-		return nullptr;
-	}
-
-	void clearBins(blockInfo inf) {
-		for (unsigned int i = 0; i < bins.size(); ++i) {
-			bins[i].erase(inf);
-		}
-	}
-
-	void updateBins(Superblock* block) {
-		for (unsigned int i = 0; i < bins.size(); ++i) {
-			if (!block->getBlockStatus(i)) {
-				bins[i].insert({ block });
-			}
-			else {
-				bins[i].erase({ block });
-			}
-		}
-	}
 };
 
-
-FreeBlocksHeap blockHeap;
+static SuperblockOwner blockOwner;
 
 class ThreadHeap {
 public:
+	std::mutex operationMutex;
 
-
-	ThreadHeap(std::map<void*, Superblock*>* _ptrToBlock,
-		std::map<Superblock*, ThreadHeap*>* _blockToHeap) {
-		ptrToBlock = _ptrToBlock;
-		blockToHeap = _blockToHeap;
-		for (int i = 0; i < BINS_NUMBER; ++i) {
-			bins.push_back(std::set <blockInfo>());
+	ThreadHeap(size_t heapId) {
+		id = heapId;
+		mainHeap = nullptr;
+		size_t curSize = 3;
+		while (curSize <= MAX_BLOCK_SIZE / 2) {
+			bins.push_back(Bin());
+			curSize *= 2;
 		}
 	}
 
-	int getSize() {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		return assignedThreads.size();
-	}
-
-	void assignThead(std::thread::id id) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		assignedThreads.insert(id);
-	}
-
-	void deassignThread(std::thread::id id) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		assignedThreads.erase(id);
+	ThreadHeap(ThreadHeap* _mainHeap,size_t heapId) {
+		id = heapId;
+		mainHeap = _mainHeap;
+		size_t curSize = 3;
+		while (curSize <= MAX_BLOCK_SIZE / 2) {
+			bins.push_back(Bin());
+			curSize *= 2;
+		}
 	}
 
 	void* allocate(size_t size) {
 		std::unique_lock<std::mutex> lock(operationMutex);
-		Superblock* block = findBlock(size);
-		if (block == nullptr) {
-			block = blockHeap.getBlock(size);
-			blocks.insert(block);
-			blockToHeap->insert(std::pair<Superblock*,ThreadHeap*>(block,this));
-		}
-		void* ptr = block->getBlock(size);
-		(*ptrToBlock)[ptr] = block;
-		updateMemory(size, true);
-		updateBins(block);
-		return ptr;
-	}
-
-	void free(void* ptr) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		Superblock* block = ptrToBlock->at(ptr);
-		size_t size = block->releaseBlock(ptr);
-		updateMemory(size, false);
-		if (checkIfEmpty()) {
-			returnBlock();
-		}
-
-	}
-
-
-private:
-
-	size_t usedMemory = 0;
-	std::mutex operationMutex;
-	std::vector<std::set<blockInfo>> bins;
-	std::set<Superblock*> blocks;
-	std::map<void*, Superblock*>* ptrToBlock;
-	std::map<Superblock*, ThreadHeap*>* blockToHeap;
-	std::set<std::thread::id> assignedThreads;
-
-
-	void returnBlock() {
-		Superblock* block = *blocks.begin();
-		blocks.erase(block);
-		clearBins({ block });
-		blockHeap.giveBlock(block);
-	}
-
-	bool checkIfEmpty() {
-		long double alpha = (long double)usedMemory / (long double)getMaxMemory();
-		if (alpha < MEMORY_FRACTION_THRESHOLD
-			&& (usedMemory < (getMaxMemory() 
-				- MIN_BLOCK_THRESHOLD * MAX_BLOCK_SIZE))) {
-			return true;
-		}
-		return false;
-	}
-
-	void updateMemory(size_t size, bool alloc) {
-		size_t size2 = 1;
-		int log = 0;
-		while (size2 < size) {
-			size2 *= 2;
-			log++;
-		}
-		if (alloc) {
-			usedMemory += size2;
-		}
-		else {
-			usedMemory -= size2;
-		}
-	}
-
-	void updateOnDeletion(Superblock* block) {
-		size_t size = MAX_BLOCK_SIZE - block->getSize();
-		usedMemory -= size;
-	}
-
-	size_t getMaxMemory() {
-		return blocks.size() * MAX_BLOCK_SIZE;
-	}
-
-	void updateBins(Superblock* block) {
-		for (unsigned int i = 0; i < bins.size(); ++i) {
-			if (!block->getBlockStatus(i)) {
-				bins[i].insert({ block });
+		Bin& currentBin = findBin(size);
+		std::pair<Superblock*, void*> allocationInfo = currentBin.scan();
+		if (allocationInfo.first == nullptr) {
+			std::unique_lock<std::mutex> lockMain(mainHeap->operationMutex);
+			Bin& mainBin = mainHeap->findBin(size);
+			std::pair<Superblock*, void*> globalAllocationInfo = mainBin.scan();
+			if (globalAllocationInfo.first != nullptr) {
+				allocationInfo.first = globalAllocationInfo.first;
+				allocationInfo.second = globalAllocationInfo.second;
+				allocationInfo.first->ownerHeap = id;
+				mainBin.updateMemory(allocationInfo.first->usedMemory,MAX_BLOCK_SIZE, false);
+				currentBin.updateMemory(allocationInfo.first->usedMemory,MAX_BLOCK_SIZE, true);
 			}
 			else {
-				bins[i].erase({ block });
+				allocationInfo.first = SuperblockOwner::getInstance().getNewBlock(size);
+				allocationInfo.first->ownerHeap = id;
+				allocationInfo.second = allocationInfo.first->getBlock();
+				currentBin.updateMemory(0, MAX_BLOCK_SIZE, true);
 			}
 		}
+		currentBin.addSuperblock(allocationInfo.first);
+		information* info = (information*)allocationInfo.second;
+		info->owner = allocationInfo.first;
+		return (void*)((char*)info + sizeof(information));
 	}
 
-	void clearBins(blockInfo inf) {
-		for (unsigned int i = 0; i < bins.size(); ++i) {
-			bins[i].erase(inf);
+	void deallocate(void* ptr,Superblock* block) {
+		Bin& currentBin = this->findBin(block->getSize());
+		block->usedMemory -= block->getSize();
+		currentBin.updateMemory(block->getSize(), 0, false);
+		currentBin.deallocate(block, ptr);
+		if (this->id == -1) {
+			this->operationMutex.unlock();
+			return;
 		}
+		tryReturnBlock(currentBin, block);
+		this->operationMutex.unlock();
 	}
 
-	Superblock* findBlock(size_t size) {
-		size_t size2 = 1;
-		int log = 0;
-		while (size2 < size) {
-			size2 *= 2;
+
+
+private:
+
+	struct information {
+		void* owner;
+	};
+
+	std::vector<Bin> bins;
+	ThreadHeap* mainHeap;
+	int id;
+
+	size_t getBinId(size_t val) {
+		size_t log = 3;
+		size_t approx = MIN_BLOCK_SIZE;
+		while (approx < val) {
+			approx *= 2;
 			log++;
 		}
-		for (unsigned int i = log; i < bins.size(); ++i) {
-			if (bins[i].size() > 0) {
-				Superblock* block = (*bins[i].begin()).block;
-				return block;
+		return log - 3;
+	}
+
+	size_t getSize(size_t val) {
+		size_t log = 3;
+		size_t approx = MIN_BLOCK_SIZE;
+		while (approx < val) {
+			approx *= 2;
+			log++;
+		}
+		return approx;
+	}
+
+	Bin& findBin(size_t size) {
+		return bins[getBinId(size)];
+	}
+
+	void tryReturnBlock(Bin& bin,Superblock* block) {
+		if ((bin.getUsed() < bin.getAllocated() - MAX_BLOCK_SIZE * MIN_BLOCK_THRESHOLD) &&
+			bin.getUsed() * MEMORY_FRACTION_THRESHOLD < bin.getAllocated()) {
+			std::unique_lock<std::mutex> lock(mainHeap->operationMutex);
+			Bin& mainBin = mainHeap->findBin(block->getSize());
+			Superblock* emptiestBlock = bin.getBlock();
+			if (emptiestBlock != nullptr) {
+				emptiestBlock->ownerHeap = -1;
+				mainBin.updateMemory(emptiestBlock->usedMemory, MAX_BLOCK_SIZE, true);
+				bin.updateMemory(emptiestBlock->usedMemory, MAX_BLOCK_SIZE, false);
+				mainBin.addSuperblock(emptiestBlock);
 			}
 		}
-		return nullptr;
 	}
-
 };
 
-
-class GlobalHeap {
-
+class Controller {
 public:
 
-	GlobalHeap() {
-		int num = std::thread::hardware_concurrency() * 2;
-		if (num == 0) {
-			num = 16;
-		}
-		for (int i = 0; i < num; ++i) {
-			threadHeaps.push_back(new ThreadHeap{&ptrToBlock,&blockToHeap});
+	Controller() {
+		mainHeap = new ThreadHeap(-1);
+		for (unsigned int i = 0; i < HEAPS_NUMBER; i++) {
+			heaps.push_back(new ThreadHeap(mainHeap,i));
 		}
 	}
 
-	~GlobalHeap() {
-		for (auto obj : threadHeaps) {
-			delete obj;
+	~Controller() {
+		for (auto heap : heaps) {
+			delete heap;
 		}
-		for (auto ptr : allocatedMemory) {
-			std::free(ptr);
-		}
+		delete mainHeap;
 	}
-	
+
 	void* allocate(size_t size) {
-		if (size > MAX_BLOCK_SIZE / 2) {
-			std::unique_lock<std::mutex> lock(operationMutex);
-			void* memoryBlock = std::malloc(size);
-			allocatedMemory.insert(memoryBlock);
-			return memoryBlock;
+		size_t totalSize = size + OFFSET;
+		if (totalSize > MAX_BLOCK_SIZE / 2) {
+			void* ptr = std::malloc(totalSize);
+			if (ptr == nullptr) {
+				return nullptr;
+			}
+			information* info = (information*)ptr;
+			info->owner = nullptr;
+			MemoryController::getInstance().remember(ptr);
+			return (void*)((char*)ptr + OFFSET);
 		}
-		return allocateToThread(size);
+		return heaps[THREAD_ID]->allocate(totalSize); 
 	}
 
-	void free(void* pointer) {
-		if (allocatedMemory.count(pointer) != 0) {
-			std::unique_lock<std::mutex> lock(operationMutex);
-			allocatedMemory.erase(pointer);
-			std::free(pointer);
+	void deallocate(void* ptr) {
+		if (ptr == nullptr) {
+			return;
 		}
-		releaseFromThread(pointer);
+		information* info = (information*)((char*)ptr - OFFSET);
+		if (info->owner == nullptr) {
+			std::free(info);
+			MemoryController::getInstance().forget(info);
+			return;
+		}
+		ThreadHeap* ownerHeap = findOwner((Superblock*)info->owner);
+		ownerHeap->deallocate(info, (Superblock*)info->owner);
 	}
 
-	void regThread(std::thread::id id) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		int heapId = getMinHeap();
-		threadMap[id] = heapId;
-		threadHeaps[heapId]->assignThead(id);
-	}
-
-	void deredThread(std::thread::id id) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		int heapId = threadMap[id];
-		threadHeaps[heapId]->deassignThread(id);
-
+	static Controller& getInstance() {
+		static Controller instance;
+		return instance;
 	}
 
 private:
 
-	std::vector<std::set<blockInfo>> bins;
-	std::set<void*> allocatedMemory;
-	
-	std::map<void*, Superblock*> ptrToBlock;
-	std::map<Superblock*, ThreadHeap*> blockToHeap;
-	std::map<std::thread::id, int> threadMap;
+	struct information {
+		void* owner;
+	};
 
-	std::vector<ThreadHeap*> threadHeaps;
+	const size_t OFFSET = sizeof(information);
 
-	std::mutex operationMutex;
+	std::vector<ThreadHeap*> heaps;
+	ThreadHeap* mainHeap;
 
-	
-
-	void* allocateToThread(size_t size) {
-		std::thread::id id = std::this_thread::get_id();
-		ThreadHeap* heap = threadHeaps[threadMap[id]];
-		return heap->allocate(size);
+	ThreadHeap* findOwner(Superblock* block) {
+		int current = -1;
+		ThreadHeap* currentHeap = mainHeap;
+		bool isFirstIter = true;
+		do {
+			if (!isFirstIter) {
+				if (current == -1) {
+					mainHeap->operationMutex.unlock();
+				}
+				else {
+					heaps[current]->operationMutex.unlock();
+				}
+			}
+			current = block->ownerHeap;
+			if (current == -1) {
+				mainHeap->operationMutex.lock();
+				currentHeap = mainHeap;
+			}
+			else {
+				heaps[current]->operationMutex.lock();
+				currentHeap = heaps[current];
+			}
+			isFirstIter = false;
+		} while (current != block->ownerHeap);
+		return currentHeap;
 	}
 
-	void releaseFromThread(void* ptr) {
-		std::unique_lock<std::mutex> lock(operationMutex);
-		Superblock* block = ptrToBlock[ptr];
-		if (blockHeap.isFree(block)) {
-			blockHeap.deallocateFromFree(ptr, block);
-			return;
+
+
+	class MemoryController {
+	public:
+
+		static MemoryController& getInstance() {
+			static MemoryController instance;
+			return instance;
 		}
-		ThreadHeap* heap = blockToHeap[block];
-		lock.unlock();
-		heap->free(ptr);
-	}
 
-	int getMinHeap() {
-		int min = 10e6;
-		int minId = 0;
-		for (unsigned int i = 0; i < threadHeaps.size(); ++i) {
-			if (threadHeaps[i]->getSize() < min) {
-				min = threadHeaps[i]->getSize();
-				minId = i;
+		void remember(void* ptr) {
+			pointers.insert(ptr);
+		}
+
+		void forget(void*  ptr) {
+			pointers.erase(ptr);
+		}
+
+		~MemoryController() {
+			for (auto ptr : pointers) {
+				std::free(ptr);
 			}
 		}
-		return minId;
-	}
+
+	private:
+		std::set<void*> pointers;
+	};
+
 
 };
-
-static GlobalHeap global;
-
-class ThreadRegister {
-public:
-	ThreadRegister() {
-		global.regThread(std::this_thread::get_id());
-	}
-
-	~ThreadRegister() {
-		global.deredThread(std::this_thread::get_id());
-	}
-};
-
-static thread_local ThreadRegister regObj;
 
 extern void* mtalloc(size_t bytes) {
-	return global.allocate(bytes);
+	return Controller::getInstance().allocate(bytes);
 }
 
 extern void mtfree(void* ptr) {
-	global.free(ptr);
+	Controller::getInstance().deallocate(ptr);
 }
